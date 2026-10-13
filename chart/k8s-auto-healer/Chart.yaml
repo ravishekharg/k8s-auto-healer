@@ -1,0 +1,6 @@
+apiVersion: v2
+name: k8s-auto-healer
+description: Replaces pods that are Running and Ready but no longer doing their job, safely.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

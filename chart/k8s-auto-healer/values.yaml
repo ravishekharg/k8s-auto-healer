@@ -1,0 +1,25 @@
+image:
+  repository: ghcr.io/ravishekharg/k8s-auto-healer
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Two replicas with leader election: one acts, the other takes over within leaseSeconds.
+replicaCount: 2
+
+# Namespaces to watch. Empty = all namespaces (ClusterRole); a list = Roles only in those
+# namespaces, which is the least-privilege option for a shared cluster.
+watchNamespaces: []
+
+dryRun: false                 # start with true in a new cluster: log and record events only
+intervalSeconds: 10
+failureThreshold: 3           # consecutive failed functional checks before acting
+cooldownSeconds: 120          # per workload, after a replacement pod has come up
+maxActionsPerHour: 10         # cluster-wide brake: a systemic outage must page a human
+startupGraceSeconds: 60       # don't judge pods that are still starting
+stuckTerminatingSeconds: 600
+crashloopMinRestarts: 5
+notifyWebhookUrl: ""          # Slack-compatible incoming webhook (optional)
+
+resources:
+  requests: { cpu: 50m, memory: 96Mi }
+  limits: { memory: 192Mi }

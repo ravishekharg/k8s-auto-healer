@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "healer.name" . }}
+  labels: {{- include "healer.labels" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "healer.name" . }}
+  labels: {{- include "healer.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels: {{- include "healer.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "healer.selector" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+    spec:
+      serviceAccountName: {{ include "healer.name" . }}
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: healer
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+            - { name: WATCH_NAMESPACES, value: {{ join "," .Values.watchNamespaces | quote }} }
+            - { name: DRY_RUN, value: {{ .Values.dryRun | quote }} }
+            - { name: INTERVAL_SECONDS, value: {{ .Values.intervalSeconds | quote }} }
+            - { name: FAILURE_THRESHOLD, value: {{ .Values.failureThreshold | quote }} }
+            - { name: COOLDOWN_SECONDS, value: {{ .Values.cooldownSeconds | quote }} }
+            - { name: MAX_ACTIONS_PER_HOUR, value: {{ .Values.maxActionsPerHour | quote }} }
+            - { name: STARTUP_GRACE_SECONDS, value: {{ .Values.startupGraceSeconds | quote }} }
+            - { name: STUCK_TERMINATING_SECONDS, value: {{ .Values.stuckTerminatingSeconds | quote }} }
+            - { name: CRASHLOOP_MIN_RESTARTS, value: {{ .Values.crashloopMinRestarts | quote }} }
+            - { name: NOTIFY_WEBHOOK_URL, value: {{ .Values.notifyWebhookUrl | quote }} }
+          ports: [{ name: metrics, containerPort: 9100 }]
+          readinessProbe: { httpGet: { path: /metrics, port: metrics }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /metrics, port: metrics }, periodSeconds: 20 }
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "healer.name" . }}-metrics
+  labels: {{- include "healer.labels" . | nindent 4 }}
+spec:
+  selector: {{- include "healer.selector" . | nindent 4 }}
+  ports: [{ name: metrics, port: 9100, targetPort: metrics }]

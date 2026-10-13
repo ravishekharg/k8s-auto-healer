@@ -1,0 +1,6 @@
+tests/
+demo/
+chart/
+scripts/
+.github/
+**/__pycache__/

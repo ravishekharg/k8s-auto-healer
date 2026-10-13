@@ -1,0 +1,60 @@
+# Leader election: a Lease in the healer's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "healer.name" . }}-leader
+  labels: {{- include "healer.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "healer.name" . }}-leader
+  labels: {{- include "healer.labels" . | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ include "healer.name" . }}-leader }
+subjects:
+  - { kind: ServiceAccount, name: {{ include "healer.name" . }}, namespace: {{ .Release.Namespace }} }
+{{- if .Values.watchNamespaces }}
+{{- range .Values.watchNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "healer.name" $ }}
+  namespace: {{ . }}
+  labels: {{- include "healer.labels" $ | nindent 4 }}
+rules:
+{{ include "healer.podRules" $ | indent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "healer.name" $ }}
+  namespace: {{ . }}
+  labels: {{- include "healer.labels" $ | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ include "healer.name" $ }} }
+subjects:
+  - { kind: ServiceAccount, name: {{ include "healer.name" $ }}, namespace: {{ $.Release.Namespace }} }
+{{- end }}
+{{- else }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "healer.name" . }}
+  labels: {{- include "healer.labels" . | nindent 4 }}
+rules:
+{{ include "healer.podRules" . | indent 2 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "healer.name" . }}
+  labels: {{- include "healer.labels" . | nindent 4 }}
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: {{ include "healer.name" . }} }
+subjects:
+  - { kind: ServiceAccount, name: {{ include "healer.name" . }}, namespace: {{ .Release.Namespace }} }
+{{- end }}

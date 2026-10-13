@@ -1,0 +1,47 @@
+# The demo workload, opted in to functional checks on /work.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+  labels: { app: shop }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: shop } }
+  template:
+    metadata:
+      labels: { app: shop }
+      annotations:
+        autohealer.io/check-path: /work
+        autohealer.io/check-port: "8080"
+        autohealer.io/failure-threshold: "3"
+        autohealer.io/timeout-seconds: "2"
+    spec:
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: app
+          image: healer-demo-app:local
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: http, containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /ready, port: http }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /health, port: http }, periodSeconds: 10 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shop
+spec:
+  selector: { app: shop }
+  ports: [{ name: http, port: 80, targetPort: http }]
+---
+# The healer evicts through the Eviction API, so this budget is respected.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: shop
+spec:
+  maxUnavailable: 1
+  selector: { matchLabels: { app: shop } }

@@ -1,0 +1,63 @@
+# Unit tests, chart checks, and the MTTR experiment on a real (kind) cluster: a pod is made to
+# hang behind passing probes, and the build fails unless the healer replaces it and the
+# failures stop.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install -r requirements.txt pytest
+          python -m pytest -q tests
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.2
+      - name: lint and render both RBAC modes
+        run: |
+          helm lint chart/k8s-auto-healer
+          helm template h chart/k8s-auto-healer > all-namespaces.yaml
+          helm template h chart/k8s-auto-healer --set 'watchNamespaces={team-a,team-b}' > scoped.yaml
+          grep -q "kind: ClusterRole" all-namespaces.yaml
+          ! grep -q "kind: ClusterRole" scoped.yaml
+      - name: kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary -kubernetes-version 1.34.0 all-namespaces.yaml scoped.yaml demo/manifests/demo.yaml
+
+  mttr-experiment:
+    runs-on: ubuntu-latest
+    needs: [unit, chart]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: healer
+      - name: build images and load them into kind
+        run: |
+          docker build -t healer:local .
+          docker build -t healer-demo-app:local demo/app
+          kind load docker-image healer:local healer-demo-app:local --name healer
+      - name: run the experiment (fails if the healer doesn't recover the service)
+        run: KUBE_CONTEXT=kind-healer WINDOW=90 bash scripts/mttr-experiment.sh
