@@ -1,4 +1,4 @@
-"""Everything the healer does to the cluster: evict, force-delete, record events, notify."""
+"""Everything the healer does to the cluster: evict, force-delete, cordon/uncordon, record events, notify."""
 from __future__ import annotations
 
 import json
@@ -52,20 +52,45 @@ class Actions:
                 return "already_gone"
             raise
 
+    def cordon(self, node, identity: str, reason: str) -> str:
+        """Mark unschedulable and record who did it and why (only our cordons are ever undone)."""
+        if self.dry_run:
+            return "dry_run"
+        self.core.patch_node(node.metadata.name, {
+            "metadata": {"annotations": {"autohealer.io/cordoned-by": identity, "autohealer.io/cordon-reason": reason}},
+            "spec": {"unschedulable": True}})
+        return "cordoned"
+
+    def uncordon(self, node) -> str:
+        if self.dry_run:
+            return "dry_run"
+        self.core.patch_node(node.metadata.name, {
+            "metadata": {"annotations": {"autohealer.io/cordoned-by": None, "autohealer.io/cordon-reason": None}},
+            "spec": {"unschedulable": False}})
+        return "uncordoned"
+
+    def node_event(self, node, reason: str, message: str, type_: str = "Warning") -> None:
+        """Events about cluster-scoped objects live in the default namespace."""
+        ref = client.V1ObjectReference(kind="Node", name=node.metadata.name, uid=node.metadata.uid, api_version="v1")
+        self._event("default", ref, node.metadata.name, reason, message, type_)
+
     def event(self, pod, reason: str, message: str, type_: str = "Warning") -> None:
         """A Kubernetes Event on the pod: shows up in `kubectl describe pod` and event exporters."""
+        ref = client.V1ObjectReference(kind="Pod", name=pod.metadata.name, namespace=pod.metadata.namespace,
+                                       uid=pod.metadata.uid, api_version="v1")
+        self._event(pod.metadata.namespace, ref, pod.metadata.name, reason, message, type_)
+
+    def _event(self, namespace: str, ref, name: str, reason: str, message: str, type_: str) -> None:
         now = datetime.now(timezone.utc)
         ev = client.CoreV1Event(
-            metadata=client.V1ObjectMeta(generate_name=f"{pod.metadata.name}.", namespace=pod.metadata.namespace),
-            involved_object=client.V1ObjectReference(kind="Pod", name=pod.metadata.name, namespace=pod.metadata.namespace,
-                                                     uid=pod.metadata.uid, api_version="v1"),
+            metadata=client.V1ObjectMeta(generate_name=f"{name}.", namespace=namespace), involved_object=ref,
             reason=reason, message=message, type=type_, first_timestamp=now, last_timestamp=now, count=1,
             source=client.V1EventSource(component=self.component), reporting_component=self.component,
         )
         try:
-            self.core.create_namespaced_event(pod.metadata.namespace, ev)
+            self.core.create_namespaced_event(namespace, ev)
         except ApiException as e:
-            log.warning("could not record event on %s/%s: %s", pod.metadata.namespace, pod.metadata.name, e.reason)
+            log.warning("could not record event on %s: %s", name, e.reason)
 
     def notify(self, text: str) -> None:
         """Optional Slack-compatible webhook ({"text": ...}); failures never stop the healer."""

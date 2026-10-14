@@ -26,6 +26,29 @@ Measured 2026-10-13 on a kind cluster (Kubernetes 1.34); CI runs the same experi
 The event the healer left on the pod: `failed functional check /work on port 8080 3 times in a
 row; evicted so its controller replaces it`.
 
+## Node remediation (opt-in: `nodeRemediation.enabled=true`)
+Nodes NotReady or under memory/disk/PID pressure past a threshold are cordoned and drained
+(Eviction API, PDB-aware), one node at a time under a separate hourly budget, and uncordoned when
+healthy again, but only nodes the healer cordoned itself. A circuit breaker stops all node
+actions when more than a third of worker nodes are unhealthy at once (a shared cause such as the
+network or control plane); a second breaker stops pod evictions when over half the checked pods
+fail together. Details: [`docs/design.md`](docs/design.md#node-remediation-opt-in).
+
+`scripts/node-failure-experiment.sh` (kind, 1 control plane + 3 workers; a worker running a
+replica is frozen with `docker pause`; the demo pods run without functional checks so only node
+remediation can act). Measured 2026-10-14:
+
+| Same node failure | All 3 replicas Ready on healthy nodes after |
+|---|---|
+| Kubernetes alone (pods evicted after the 300 s not-ready toleration) | 362 s |
+| With node remediation (NotReady 20 s -> cordon + drain) | **74 s** (cordoned at 74 s, node NotReady at 52 s) |
+| Node back | uncordoned by the healer ~30 s after Ready (`recoverySeconds=30`) |
+
+Circuit breaker: unit-tested (`tests/test_breaker.py`, `tests/test_nodes.py`). In the live run,
+nothing was cordoned with 2 of 3 workers frozen, but the breaker's log line couldn't be confirmed:
+both healer replicas were likely on the frozen workers. The experiment now runs the healer on the
+control plane; CI's `node-experiment` job checks it.
+
 ## How it works
 
 ```
@@ -82,8 +105,9 @@ helm install healer chart/k8s-auto-healer -n healer-system --create-namespace --
 ## Status
 | Part | Status |
 |---|---|
-| Unit tests | 19 passing |
+| Unit tests | 35 passing (policy, pods, leader election, circuit breaker, node remediation) |
 | Functional-check remediation | Verified by the experiment above (local kind and CI) |
 | Leader election | Unit-tested against a fake Lease API with resourceVersion conflicts |
 | Stuck-Terminating and CrashLoop reporting | Implemented and unit-tested at the parsing level; not exercised in the experiment |
+| Node remediation | NotReady -> cordon/drain/uncordon verified live (table above); circuit breaker unit-tested, live check in CI |
 | Scale | Polls the API every interval; for very large clusters use watches/informers (see design notes) |

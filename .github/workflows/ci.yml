@@ -61,3 +61,15 @@ jobs:
           kind load docker-image healer:local healer-demo-app:local --name healer
       - name: run the experiment (fails if the healer doesn't recover the service)
         run: KUBE_CONTEXT=kind-healer WINDOW=90 bash scripts/mttr-experiment.sh
+
+  node-experiment:
+    runs-on: ubuntu-latest
+    needs: [unit, chart]
+    steps:
+      - uses: actions/checkout@v4
+      - name: build images
+        run: |
+          docker build -t healer:local .
+          docker build -t healer-demo-app:local demo/app
+      - name: node failure, recovery and circuit breaker (fails unless all three behave)
+        run: bash scripts/node-failure-experiment.sh

@@ -22,6 +22,12 @@ spec:
     spec:
       serviceAccountName: {{ include "healer.name" . }}
       securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: healer
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -39,6 +45,14 @@ spec:
             - { name: STUCK_TERMINATING_SECONDS, value: {{ .Values.stuckTerminatingSeconds | quote }} }
             - { name: CRASHLOOP_MIN_RESTARTS, value: {{ .Values.crashloopMinRestarts | quote }} }
             - { name: NOTIFY_WEBHOOK_URL, value: {{ .Values.notifyWebhookUrl | quote }} }
+            - { name: POD_MAX_FAILING_FRACTION, value: {{ .Values.podMaxFailingFraction | quote }} }
+            - { name: NODE_REMEDIATION, value: {{ .Values.nodeRemediation.enabled | quote }} }
+            - { name: NODE_NOT_READY_SECONDS, value: {{ .Values.nodeRemediation.notReadySeconds | quote }} }
+            - { name: NODE_PRESSURE_SECONDS, value: {{ .Values.nodeRemediation.pressureSeconds | quote }} }
+            - { name: NODE_RECOVERY_SECONDS, value: {{ .Values.nodeRemediation.recoverySeconds | quote }} }
+            - { name: NODE_MAX_UNHEALTHY_FRACTION, value: {{ .Values.nodeRemediation.maxUnhealthyFraction | quote }} }
+            - { name: NODE_MAX_ACTIONS_PER_HOUR, value: {{ .Values.nodeRemediation.maxActionsPerHour | quote }} }
+            - { name: NODE_DRAIN, value: {{ .Values.nodeRemediation.drain | quote }} }
           ports: [{ name: metrics, containerPort: 9100 }]
           readinessProbe: { httpGet: { path: /metrics, port: metrics }, periodSeconds: 10 }
           livenessProbe: { httpGet: { path: /metrics, port: metrics }, periodSeconds: 20 }

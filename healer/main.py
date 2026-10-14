@@ -10,11 +10,20 @@ Every INTERVAL seconds (leader only):
    never force-deleted: two pods with the same identity could end up running.
 4. CrashLoopBackOff: reported (Event, metric, webhook), never restarted: a restart can't fix a
    crash loop, and evicting would only hide it.
+5. Nodes (NODE_REMEDIATION=true): cordon and drain nodes NotReady or under pressure past a
+   threshold, uncordon them on recovery; see nodes.py.
+
+Two circuit breakers (breaker.py) stop actions when failures look systemic: "pods" opens when
+more than POD_MAX_FAILING_FRACTION of the checked pods fail in one loop (a shared dependency is
+down; evicting pods that are blocked on it would only add churn); "nodes" opens when more than
+NODE_MAX_UNHEALTHY_FRACTION of worker nodes are unhealthy.
 
 Environment (see chart/values.yaml): WATCH_NAMESPACES (comma list, empty = all), DRY_RUN,
 INTERVAL_SECONDS, FAILURE_THRESHOLD, COOLDOWN_SECONDS, MAX_ACTIONS_PER_HOUR,
 STARTUP_GRACE_SECONDS, STUCK_TERMINATING_SECONDS, CRASHLOOP_MIN_RESTARTS, NOTIFY_WEBHOOK_URL,
-POD_NAMESPACE, POD_NAME (for leader election).
+POD_NAMESPACE, POD_NAME (for leader election), POD_MAX_FAILING_FRACTION, NODE_REMEDIATION,
+NODE_NOT_READY_SECONDS, NODE_PRESSURE_SECONDS, NODE_RECOVERY_SECONDS, NODE_MAX_UNHEALTHY_FRACTION,
+NODE_MAX_ACTIONS_PER_HOUR, NODE_DRAIN.
 """
 from __future__ import annotations
 
@@ -30,7 +39,9 @@ from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from . import pods as P
 from .actions import Actions
+from .breaker import CircuitBreaker
 from .leader import LeaderElector
+from .nodes import NodeRemediator
 from .policy import ActionBudget, Policy, Verdict, WorkloadGuard
 
 log = logging.getLogger("healer")
@@ -40,6 +51,8 @@ REMEDIATIONS = Counter("healer_remediations_total", "Actions taken", ["reason", 
 SUPPRESSED = Counter("healer_suppressed_total", "Remediations held back by a safety rule", ["reason"])
 CRASHLOOPS = Counter("healer_crashloops_detected_total", "Pods reported in CrashLoopBackOff")
 LEADER = Gauge("healer_is_leader", "1 if this replica is the active leader")
+CIRCUIT_OPEN = Gauge("healer_circuit_open", "1 while a circuit breaker is open (no actions in that scope)", ["scope"])
+NODE_ACTIONS = Counter("healer_node_actions_total", "Node remediation steps", ["action"])
 LOOP = Histogram("healer_loop_seconds", "Duration of one reconcile loop", buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10))
 
 
@@ -68,6 +81,8 @@ class Healer:
                              guard=WorkloadGuard(cooldown=float(env("COOLDOWN_SECONDS", "120"))),
                              budget=ActionBudget(limit=int(env("MAX_ACTIONS_PER_HOUR", "10"))))
         self.reported_crashloops: dict[str, float] = {}
+        self.pod_breaker = CircuitBreaker("pods", reset_timeout=float(env("COOLDOWN_SECONDS", "120")))
+        self.max_failing_fraction = float(env("POD_MAX_FAILING_FRACTION", "0.5"))
         self.pool = ThreadPoolExecutor(max_workers=32)
 
         try:
@@ -76,6 +91,18 @@ class Healer:
             config.load_kube_config()
         self.core = client.CoreV1Api()
         self.actions = Actions(self.core, self.dry_run, env("NOTIFY_WEBHOOK_URL", "") or None)
+        self.nodes = None
+        if env("NODE_REMEDIATION", "false").lower() == "true":
+            self.nodes = NodeRemediator(
+                list_nodes=lambda: self.core.list_node().items,
+                pods_on=lambda name: self.core.list_pod_for_all_namespaces(field_selector=f"spec.nodeName={name}").items,
+                actions=self.actions,
+                not_ready_after=float(env("NODE_NOT_READY_SECONDS", "120")),
+                pressure_after=float(env("NODE_PRESSURE_SECONDS", "120")),
+                recover_after=float(env("NODE_RECOVERY_SECONDS", "120")),
+                max_unhealthy_fraction=float(env("NODE_MAX_UNHEALTHY_FRACTION", "0.34")),
+                drain=env("NODE_DRAIN", "true").lower() == "true",
+                budget=ActionBudget(limit=int(env("NODE_MAX_ACTIONS_PER_HOUR", "2"))))
         self.elector = LeaderElector(client.CoordinationV1Api(), env("POD_NAMESPACE", "default"), "k8s-auto-healer",
                                      identity=env("POD_NAME", socket.gethostname()))
 
@@ -98,11 +125,24 @@ class Healer:
                     and P.running_for(pod) >= self.startup_grace and P.workload_of(pod)):
                 candidates.append((pod, spec))
         results = list(self.pool.map(lambda ps: functional_check(*ps), candidates))
+        now = time.time()
+        failing = results.count(False)
+        if len(results) >= 4 and failing / len(results) > self.max_failing_fraction:
+            reason = f"{failing} of {len(results)} checked pods failing at once"
+            if self.pod_breaker.trip(now, reason):
+                log.error("pod remediation PAUSED: %s (shared cause?)", reason)
+                self.actions.notify(f"pod remediation PAUSED: {reason}. Likely a shared dependency; not evicting. Needs a human.")
+        elif self.pod_breaker.clear_systemic(now, "failing fraction back under the limit"):
+            log.warning("pod remediation resumed")
+        CIRCUIT_OPEN.labels("pods").set(1 if self.pod_breaker.is_open else 0)
         for (pod, spec), healthy in zip(candidates, results):
             CHECKS.labels("pass" if healthy else "fail").inc()
             workload = P.workload_of(pod)
             verdict = self.policy.decide(pod.metadata.uid, workload, healthy, spec.threshold)
-            if verdict == Verdict.REMEDIATE:
+            if verdict == Verdict.REMEDIATE and not self.pod_breaker.allow(now):
+                SUPPRESSED.labels("circuit_open").inc()
+                log.info("held back %s/%s: circuit open (%s)", pod.metadata.namespace, pod.metadata.name, self.pod_breaker.reason)
+            elif verdict == Verdict.REMEDIATE:
                 self.remediate(pod, workload, spec)
             elif verdict != Verdict.NONE:
                 SUPPRESSED.labels(verdict.value).inc()
@@ -119,7 +159,6 @@ class Healer:
                 self.actions.notify(f"{pod.metadata.namespace}/{pod.metadata.name}: {msg}")
 
         # 4. crash loops: report once per pod per hour
-        now = time.time()
         for pod in pod_list:
             found = P.crashlooping(pod, self.crashloop_restarts)
             if found and now - self.reported_crashloops.get(pod.metadata.uid, 0) > 3600:
@@ -132,8 +171,23 @@ class Healer:
                 CRASHLOOPS.inc()
                 self.reported_crashloops[pod.metadata.uid] = now
 
+        # 5. nodes
+        if self.nodes:
+            seen = len(self.nodes.log)
+            self.nodes.step(now)
+            for action, node, detail in self.nodes.log[seen:]:
+                NODE_ACTIONS.labels(action).inc()
+                log.warning("node %s: %s %s", node or "-", action, detail)
+            del self.nodes.log[:-100]
+            CIRCUIT_OPEN.labels("nodes").set(1 if self.nodes.breaker.is_open else 0)
+
     def remediate(self, pod, workload: str, spec: P.CheckSpec) -> None:
-        result = self.actions.evict(pod)
+        try:
+            result = self.actions.evict(pod)
+        except Exception as e:  # noqa: BLE001 - API errors feed the breaker
+            self.pod_breaker.record_failure(time.time(), f"evicting {pod.metadata.name} failed: {e}")
+            raise
+        self.pod_breaker.record_success(time.time())
         REMEDIATIONS.labels("functional_check_failed", result).inc()
         name = f"{pod.metadata.namespace}/{pod.metadata.name}"
         if result in ("evicted", "dry_run"):

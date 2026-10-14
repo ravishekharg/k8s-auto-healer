@@ -19,6 +19,24 @@ startupGraceSeconds: 60       # don't judge pods that are still starting
 stuckTerminatingSeconds: 600
 crashloopMinRestarts: 5
 notifyWebhookUrl: ""          # Slack-compatible incoming webhook (optional)
+podMaxFailingFraction: 0.5    # circuit breaker: more than this share of checked pods failing at once = shared cause, stop evicting
+
+# Node remediation: cordon + drain nodes NotReady or under Memory/Disk/PID pressure past a
+# threshold, uncordon them after they recover. Needs cluster-wide RBAC on nodes and pods
+# (granted only when enabled), whatever watchNamespaces says.
+nodeRemediation:
+  enabled: false
+  notReadySeconds: 120
+  pressureSeconds: 120
+  recoverySeconds: 120          # healthy this long before an uncordon
+  maxUnhealthyFraction: 0.34    # circuit breaker: more unhealthy workers than this = shared cause, do nothing
+  maxActionsPerHour: 2
+  drain: true                   # false = cordon only
+
+# With node remediation on, keep the healer off the nodes it may drain (e.g. a system node
+# group, or the control plane where that's allowed): a healer on a dead node can't heal it.
+nodeSelector: {}
+tolerations: []
 
 resources:
   requests: { cpu: 50m, memory: 96Mi }
